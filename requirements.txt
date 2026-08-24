@@ -1,5 +1,3 @@
-flask
 requests
 solapi
 python-dotenv
-gunicorn
