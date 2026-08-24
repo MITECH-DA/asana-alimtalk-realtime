@@ -1,0 +1,63 @@
+name: Asana 댓글 및 High 우선순위 태스크 알림톡 폴링
+
+on:
+  schedule:
+    # GitHub이 허용하는 최소 간격인 5분. 부하가 높은 시간대(정각/30분 부근)에는
+    # 실제 실행이 몇 분 지연될 수 있습니다(GitHub의 best-effort 스케줄링).
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # Actions 탭에서 수동으로도 실행 가능
+
+permissions:
+  contents: write  # sync 토큰 상태 파일을 이 저장소에 커밋하기 위해 필요
+
+concurrency:
+  group: asana-alimtalk-poll
+  cancel-in-progress: false  # 이전 실행이 아직 상태 커밋 중이면 겹쳐 실행되지 않도록 대기
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 폴링 스크립트 실행
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_PROJECT_GID: ${{ secrets.ASANA_PROJECT_GID }}
+          SOLAPI_API_KEY: ${{ secrets.SOLAPI_API_KEY }}
+          SOLAPI_API_SECRET: ${{ secrets.SOLAPI_API_SECRET }}
+          SOLAPI_PF_ID: ${{ secrets.SOLAPI_PF_ID }}
+          SOLAPI_TEMPLATE_ID_COMMENT: ${{ secrets.SOLAPI_TEMPLATE_ID_COMMENT }}
+          SOLAPI_TEMPLATE_ID_HIGH_PRIORITY: ${{ secrets.SOLAPI_TEMPLATE_ID_HIGH_PRIORITY }}
+          SENDER_PHONE: ${{ secrets.SENDER_PHONE }}
+          RECIPIENT_PHONES: ${{ secrets.RECIPIENT_PHONES }}
+          PRIORITY_FIELD_NAME: ${{ vars.PRIORITY_FIELD_NAME || 'Priority' }}
+          PRIORITY_HIGH_VALUE: ${{ vars.PRIORITY_HIGH_VALUE || 'High' }}
+          SYNC_TOKEN_FILE: state/.asana_sync_token
+          # public 저장소이므로 로그에 태스크명/댓글내용/담당자/전화번호가 찍히지
+          # 않도록 기본값(false)을 명시적으로 고정합니다. 절대 true로 바꾸지 마세요.
+          LOG_SENSITIVE_DETAILS: "false"
+        run: |
+          mkdir -p state
+          python asana_poll_alimtalk.py
+
+      - name: 폴링 상태 커밋
+        run: |
+          # sync 토큰 갱신분을 저장소에 반영하고, 매 실행마다 커밋을 남겨
+          # "60일간 활동 없으면 스케줄 자동 비활성화" 정책에 걸리지 않게 합니다.
+          git config user.name "asana-alimtalk-bot"
+          git config user.email "actions@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > state/last_run_at.txt
+          git add state/
+          git diff --cached --quiet || git commit -m "chore: update polling state"
+          git pull --rebase --autostash
+          git push
