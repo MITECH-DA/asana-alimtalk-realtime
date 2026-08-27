@@ -8,15 +8,23 @@ Asana 프로젝트 짧은 주기 폴링 → 신규 댓글 / High 우선순위 �
      이벤트 버스를 쓰기 때문에, 단순히 tasks를 modified_since로 훑는 것보다
      신뢰도가 높습니다.)
   2) 이벤트 중 "댓글(스토리) 추가"는 즉시 댓글 알림 템플릿으로 발송합니다.
-  3) "태스크 추가" 이벤트는 태스크를 다시 조회해서 우선순위 커스텀 필드가 "High"인
-     경우에만 High 우선순위 알림 템플릿으로 발송합니다.
-     (Events API 응답 자체에는 커스텀 필드 값이 없어서 추가 조회가 필요합니다.)
-  4) crontab 등으로 이 스크립트를 1~5분 간격으로 반복 실행하면 되고, 상시 켜져
+  3) "태스크 추가" 이벤트는 태스크를 다시 조회해서 생성 시점에 이미 우선순위가
+     "High"로 지정돼 있는 경우에만 High 우선순위 알림 템플릿으로 발송합니다.
+  4) "기존 태스크의 우선순위를 나중에 High로 바꾼 경우"는 3)의 task 이벤트로는
+     잡히지 않습니다 — 아사나가 2026-08-02 무렵부터 task의 "changed" 이벤트
+     (커스텀필드 변경 포함)를 웹훅/Events API 양쪽에서 안정적으로 보내주지 않는
+     회귀가 있기 때문입니다(아사나 개발자 포럼에 다수 보고, 공식 수정 없음).
+     대신 커스텀필드 값이 바뀔 때 자동으로 남는 스토리(resource_subtype=
+     enum_custom_field_changed — "story added" 이벤트라 정상적으로 전달됨)를
+     감지해서, 그 변경이 우리가 감시하는 우선순위 필드이고 새 값이 "High"일
+     때만 발송합니다.
+  5) crontab 등으로 이 스크립트를 1~5분 간격으로 반복 실행하면 되고, 상시 켜져
      있는 서버는 필요 없습니다. 다만 완전한 즉시성은 아니고 "몇 분 이내"의
      준실시간(near real-time)입니다 — Asana 문서 기준 이벤트 반영 지연은 평균
      1분, 최대 10분까지 걸릴 수 있어 폴링 주기와 합쳐지면 최악의 경우 10여 분
      늦어질 수 있습니다. 완전한 즉시 알림이 필요하면 상시 웹훅 서버 방식
-     (asana_webhook_server.py)을 쓰세요.
+     (asana_webhook_server.py — 다만 이 스크립트도 4)의 회귀 이슈를 반영하려면
+     동일하게 업데이트가 필요합니다)을 쓰세요.
 
 사전 준비 (기존 asana_weekly_summary_alimtalk_multi.py와 동일 + 아래 추가)
   - 아래 두 알림톡 템플릿을 각각 카카오에 등록·승인받아야 합니다.
@@ -174,12 +182,18 @@ def fetch_events() -> list:
 # 3. Asana API 조회 헬퍼
 # ------------------------------------------------------------------
 def fetch_story(story_gid: str) -> dict:
-    """댓글(스토리) 상세 조회. target(부모 태스크) 이름/링크까지 함께 받아옵니다."""
+    """스토리(댓글 또는 커스텀필드 변경 로그 등) 상세 조회.
+
+    target(부모 태스크) 이름/링크와, 커스텀필드 변경 스토리(resource_subtype=
+    enum_custom_field_changed)를 판별하기 위한 custom_field.name / new_enum_value.name도
+    함께 받아옵니다. 댓글이 아닌 스토리에는 이 필드들이 비어있을 뿐이라 문제없습니다.
+    """
     url = f"{ASANA_API_BASE}/stories/{story_gid}"
     params = {
         "opt_fields": (
             "text,resource_subtype,created_by.name,created_at,"
-            "target.name,target.permalink_url,target.gid"
+            "target.name,target.permalink_url,target.gid,"
+            "custom_field.name,new_enum_value.name"
         )
     }
     resp = requests.get(url, headers=ASANA_HEADERS, params=params, timeout=10)
@@ -247,15 +261,32 @@ def send_to_all(template_id: str, variables: dict) -> None:
 # ------------------------------------------------------------------
 # 5. 이벤트별 처리
 # ------------------------------------------------------------------
-def handle_comment_event(event: dict) -> None:
+def handle_story_event(event: dict) -> None:
+    """story(added) 이벤트 하나를 받아 종류에 따라 분기합니다.
+
+    아사나가 2026-08-02 무렵부터 task의 "changed" 이벤트(커스텀필드 변경 포함)를
+    웹훅/Events API 양쪽에서 안정적으로 보내주지 않는 회귀가 있어(아사나 개발자
+    포럼에 다수 보고, 공식 수정 없음), "이미 있던 태스크의 Priority를 나중에
+    High로 바꾼 경우"는 task 이벤트만으로는 감지할 수 없습니다. 대신 커스텀필드
+    값이 바뀔 때 태스크에 자동으로 남는 스토리(resource_subtype=
+    enum_custom_field_changed)를 이용합니다 — 이 스토리는 댓글과 마찬가지로
+    "story added" 이벤트라 정상적으로 전달됩니다.
+    """
     story_gid = event.get("resource", {}).get("gid")
     if not story_gid:
         return
 
     story = fetch_story(story_gid)
-    if story.get("resource_subtype") != "comment_added":
-        return  # 방어적 체크 (댓글 외 스토리 타입 제외)
+    subtype = story.get("resource_subtype")
 
+    if subtype == "comment_added":
+        _send_comment_alert(story, story_gid)
+    elif subtype == "enum_custom_field_changed":
+        _send_priority_field_changed_alert(story, story_gid)
+    # 그 외 subtype(담당자 변경, 마감일 변경, 완료 처리 등)은 무시
+
+
+def _send_comment_alert(story: dict, story_gid: str) -> None:
     task = story.get("target") or {}
     variables = {
         "태스크명": (task.get("name") or "")[:50],
@@ -270,6 +301,37 @@ def handle_comment_event(event: dict) -> None:
     else:
         print(f"[댓글 알림] 발송 (story_gid={story_gid})")
     send_to_all(SOLAPI_TEMPLATE_ID_COMMENT, variables)
+
+
+def _send_priority_field_changed_alert(story: dict, story_gid: str) -> None:
+    """기존 태스크의 우선순위 커스텀필드가 (다른 값 → High)로 바뀐 경우 발송합니다."""
+    custom_field = story.get("custom_field") or {}
+    new_value = story.get("new_enum_value") or {}
+
+    if custom_field.get("name") != PRIORITY_FIELD_NAME:
+        return  # 우리가 감시하는 우선순위 필드가 아닌 다른 단일선택 필드 변경이면 무시
+    if new_value.get("name") != PRIORITY_HIGH_VALUE:
+        return  # High로 "바뀐" 게 아니면(예: High→Medium, 혹은 다른 옵션 간 변경) 무시
+
+    task_ref = story.get("target") or {}
+    task_gid = task_ref.get("gid")
+    if not task_gid:
+        return
+
+    task = fetch_task(task_gid)  # 담당자/마감일 등 최신 상세 정보 확보
+    variables = {
+        "태스크명": (task.get("name") or task_ref.get("name") or "")[:50],
+        "담당자": (task.get("assignee") or {}).get("name", "미배정"),
+        "마감일": task.get("due_on") or "마감일 미정",
+        "asana_link": _strip_scheme(
+            task.get("permalink_url") or task_ref.get("permalink_url") or f"https://app.asana.com/0/0/{task_gid}"
+        ),
+    }
+    if LOG_SENSITIVE_DETAILS:
+        print("[High 우선순위 알림-필드변경] 발송 변수:", json.dumps(variables, ensure_ascii=False))
+    else:
+        print(f"[High 우선순위 알림-필드변경] 발송 (task_gid={task_gid}, story_gid={story_gid})")
+    send_to_all(SOLAPI_TEMPLATE_ID_HIGH_PRIORITY, variables)
 
 
 def handle_task_added_event(event: dict) -> None:
@@ -318,7 +380,7 @@ if __name__ == "__main__":
 
             if resource_type == "story" and action == "added" and gid and gid not in seen_story_gids:
                 seen_story_gids.add(gid)
-                handle_comment_event(event)
+                handle_story_event(event)
             elif resource_type == "task" and action == "added" and gid and gid not in seen_task_gids:
                 seen_task_gids.add(gid)
                 handle_task_added_event(event)
